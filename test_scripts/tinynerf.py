@@ -7,6 +7,7 @@ from tqdm import tqdm
 import tinygrad.nn as nn
 from tinygrad.tensor import Tensor, dtypes
 from tinygrad.function import Relu, Sigmoid
+from tinygrad import TinyJit
 from PIL import Image
 from typing import List, Dict
 
@@ -127,7 +128,7 @@ class tinyNGP:
         
         self.color_MLP: List =[
             nn.Linear(self.dir3d_uncode + self.density_MLP_units_out, 64),
-            Relu(device=self.device),
+            Relu(device=self.device).apply,
             nn.Linear(64, 64),
             Relu(device=self.device).apply,
             nn.Linear(64, 3),
@@ -140,26 +141,26 @@ class tinyNGP:
         for j in range(self.L):
             out.append((2**j * x).sin())
             out.append((2**j * x).cos())
-        print(out)
+        #print(out)
         return Tensor.cat(*out, dim=1)
 
-    def __call__(self, x: Tensor, d):
-        
-        x /= self.aabb_scale
+    def __call__(self, x: Tensor, d)-> tuple[Tensor, Tensor]:
+        x = x / self.aabb_scale
         assert x.shape[1] == 3, "Input tensor x must have shape (N, 3)"
         mask = (x[:, 0].abs() < .5).int() & (x[:, 1].abs() < .5).int() & (x[:, 2].abs() < .5).int()
-        mask = mask.to(x.device)  # Ensure mask is on the same device as x
-        x += 0.5 # x in [0, 1]^3
+        mask.requires_grad = False
+        mask = mask.to(x.device)
+        x = x + 0.5  # x in [0, 1]^3
         
-        color = Tensor.zeros((x.shape[0], 3), device=x.device)
-        log_sigma = (Tensor.zeros((x.shape[0]), device=x.device) - 1e5).contiguous() # when we compute sigma it will be 0 (?)
-        features = Tensor.empty((x[mask].shape[0], self.F * len(self.Nl)), device=x.device)
-             
+        color = Tensor.zeros((x.shape[0], 3), device=x.device).contiguous()
+        log_sigma = (Tensor.zeros((x.shape[0],), device=x.device) - 1e5).contiguous()
+        log_sigma.requires_grad = False
+        
+        features = Tensor.zeros((x.shape[0], self.F * len(self.Nl)), device=x.device).contiguous()
+        
         for i, N in enumerate(self.Nl):
-            # compute vertices
-            floor = Tensor.floor(x[mask] * N)
-            #print(floor.numpy())
-            ceil = Tensor.ceil(x[mask] * N)
+            floor = Tensor.floor(x * N)
+            ceil = Tensor.ceil(x * N)
             vertices = Tensor.zeros((x[mask].shape[0], 8, 3), dtype=dtypes.int32, device=x.device)
             vertices = vertices.contiguous()
             vertices[:, 0] = floor
@@ -190,13 +191,17 @@ class tinyNGP:
                 torch.tensor(volume.numpy(), dtype=torch.float32),
                 torch.tensor(((x[mask] * N - floor) - 0.5).numpy(), dtype=torch.float32).unsqueeze(1).unsqueeze(1).unsqueeze(1)
                 ).squeeze(-1).squeeze(-1).squeeze(-1).numpy())# this is still bad, but it's a start
-
-                        
-        xi = self.positional_encoding(d[mask])
+               
+        xi = self.positional_encoding(d)
         h = features.sequential(self.density_MLP)
-        log_sigma[mask] = h[:, 0]
-        color[mask] = Tensor.cat(xi, h[:, 1:], dim=1).sequential(self.color_MLP)
+        #h.requires_grad = False
+        print(f"xi shape: {xi.shape}")
+        print(f"h[:, 1:] shape: {h[:, 1:].shape}")
+        log_sigma = Tensor.where(mask, h[:, 0], log_sigma)
+        color = Tensor.where(mask.unsqueeze(-1), h.cat(xi, dim=1).sequential(self.color_MLP), color)
+
         return color, Tensor.exp(log_sigma)
+    
 
 class TinyDataLoader:
     def __init__(self, dataset, batch_size, shuffle=True):
@@ -227,35 +232,39 @@ def cumprod(input, dim, dtype=None):
     # Ensure input is a tinygrad Tensor
     if not isinstance(input, Tensor):
         input = Tensor(input)
-
+    
     # Get the shape of the input tensor
     shape = input.shape
-
+    
     # Reshape the tensor to bring the dimension to be cumulated over to the end
     permutation = list(range(len(shape)))
     permutation.remove(dim)
     permutation.append(dim)
-    reshaped_input = input.transpose(permutation)
-
+    
+    # Transpose the input tensor according to the permutation
+    reshaped_input = input.permute(*permutation)  # Use * to unpack the list
+    
     # Compute the cumulative product along the last dimension
     reshaped_output = Tensor(reshaped_input.numpy().cumprod(axis=-1))
-
-    # Reshape the output tensor back to the original shape
-    output = reshaped_output.transpose(permutation)
-
+    
+    # Transpose the output tensor back to the original shape
+    inverse_permutation = list(range(len(shape)))
+    inverse_permutation.insert(dim, inverse_permutation.pop())  # Move last to original dim
+    output = reshaped_output.permute(*inverse_permutation)  # Use * to unpack the list
+    
     # Cast the output to the specified data type if provided
     if dtype is not None:
         output = output.cast(dtype)
-
+    
     return output
 
 
 def compute_accumulated_transmittance(alphas):
     accumulated_transmittance = cumprod(alphas, dim=1)
-    return Tensor.cat((Tensor.ones((accumulated_transmittance.shape[0], 1), device=alphas.device),
-                      accumulated_transmittance[:, :-1]), dim=-1)
+    return Tensor.cat(Tensor.ones((accumulated_transmittance.shape[0], 1), device=alphas.device),
+                      accumulated_transmittance[:, :-1], dim=-1)
 
-def render_rays(nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=192):
+def render_rays(nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=192)-> Tensor:
     device = ray_origins.device
     t = Tensor(np.linspace(hn, hf, nb_bins)).expand(ray_origins.shape[0], nb_bins)
     # Perturb sampling along each ray.
@@ -266,7 +275,6 @@ def render_rays(nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=1
     t = lower + (upper - lower) * u  # [batch_size, nb_bins]
     delta = Tensor.cat(t[:, 1:] - t[:, :-1], Tensor(
         [1e10], device=device).expand(ray_origins.shape[0], 1), dim=-1)
-
     # Compute the 3D points along each ray
     x = ray_origins.unsqueeze(1) + t.unsqueeze(2) * ray_directions.unsqueeze(1)
     # Expand the ray_directions tensor to match the shape of x
@@ -274,22 +282,27 @@ def render_rays(nerf_model, ray_origins, ray_directions, hn=0, hf=0.5, nb_bins=1
     colors, sigma = nerf_model(x.reshape(-1, 3), ray_directions.reshape(-1, 3))
     alpha = 1 - Tensor.exp(-sigma.reshape(x.shape[:-1]) * delta)  # [batch_size, nb_bins]
     weights = compute_accumulated_transmittance(1 - alpha).unsqueeze(2) * alpha.unsqueeze(2)
-    c = (weights * colors.reshape(x.shape)).sum(dim=1)
+    c = (weights * colors.reshape(x.shape)).sum(axis=1)
     weight_sum = weights.sum(-1).sum(-1)  # Regularization for white background
     return c + 1 - weight_sum.unsqueeze(-1)
 
 def train(nerf_model: tinyNGP, optimizer: nn.optim.LAMB, data_loader: TinyDataLoader, device='cpu', hn=0, hf=1, nb_epochs=10, nb_bins=192, H=400, W=400):
+    Tensor.training = True
     for _ in range(nb_epochs):
         for batch in tqdm(data_loader):
             ray_origins = batch[:, :3].to(device)
             ray_directions = batch[:, 3:6].to(device)
             gt_px_values = batch[:, 6:].to(device)
-
-            pred_px_values = render_rays(nerf_model, ray_origins, ray_directions, hn=hn, hf=hf, nb_bins=nb_bins)
+            def render_rays_jit():
+                return render_rays(nerf_model, ray_origins, ray_directions, hn=hn, hf=hf, nb_bins=nb_bins)
+            pred_px_values = TinyJit(render_rays_jit)()
             loss = ((gt_px_values - pred_px_values) ** 2).mean()
 
             optimizer.zero_grad()
             loss.backward()
+            for param in optimizer.params:
+                if param.grad is None:
+                    param.grad = Tensor.zeros_like(param)
             optimizer.step()
             
 if __name__ == "__main__":
@@ -325,11 +338,18 @@ if __name__ == "__main__":
 
     # Combine the lists of tensors
     params = lookup_tables_list + density_MLP_params + color_MLP_params
+    
+    # After creating the params list
+    for param in params:
+        if isinstance(param, Tensor):
+            param.requires_grad = True
 
-    # Create the optimizer with the combined parameter list
+
+    # Now create the optimizer
     model_optimizer = nn.optim.Adam(params, lr=1e-3)
 
     data_loader = TinyDataLoader(training_dataset, batch_size=2**14, shuffle=True)
     train(model, model_optimizer, data_loader, nb_epochs=1, device=device, hn=2, hf=6, nb_bins=192, H=800, W=800)
-    for img_index in range(200):
-        test(2, 6, testing_dataset, img_index, nb_bins=192, H=800, W=800)
+    Tensor.training = False
+    # for img_index in range(200):
+    #     test(2, 6, testing_dataset, img_index, nb_bins=192, H=800, W=800)
