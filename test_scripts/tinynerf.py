@@ -25,73 +25,78 @@ def test(hn, hf, dataset, img_index, chunk_size=20, nb_bins=192, H=400, W=400):
     img = Image.fromarray(img)
     img.save(f'novel_views/img_{img_index}.png')
 
-def grid_sample_5d(input: Tensor, grid:Tensor, mode='bilinear', padding_mode='zeros', align_corners=False):
+def grid_sample_5d(input: Tensor, grid: Tensor, mode='bilinear', padding_mode='zeros', align_corners=False):
     # Ensure input is a 5D tensor
     assert len(input.shape) == 5, "Input must be a 5D tensor"
     # Ensure grid is a 5D tensor
     assert len(grid.shape) == 5, "Grid must be a 5D tensor"
     assert grid.shape[-1] == 3, "Grid must have 3 channels (x, y, z)"
-    
+
     # Extract dimensions
     N, C, D, H, W = input.shape
-    _, _, out_D, out_H, out_W = grid.shape
-    
+    _, out_D, out_H, out_W, _ = grid.shape
+
     # Normalize grid coordinates to [-1, 1]
     if align_corners:
-        grid = ((grid + 1) / 2) * Tensor([W-1, H-1, D-1])
+        grid = ((grid + 1) / 2) * Tensor([D-1, H-1, W-1], device=grid.device)
     else:
-        grid = ((grid + 1) * Tensor([W, H, D]) - 1) / 2
-    
+        grid = ((grid + 1) * Tensor([D, H, W], device=grid.device) - 1) / 2
+
     # Clip coordinates to be within the volume bounds
     if padding_mode == 'zeros':
         grid = grid.clip(-1, 1)
     elif padding_mode == 'border':
-        grid = grid.clip(0, Tensor([W-1, H-1, D-1]))
+        grid = grid.clip(0, Tensor([D-1, H-1, W-1], device=grid.device))
     elif padding_mode == 'reflection':
-        grid = ((grid.abs() - Tensor([W, H, D])).abs() - Tensor([W, H, D])).abs()
-    
+        grid = ((grid.abs() - Tensor([D, H, W], device=grid.device)).abs() - Tensor([D, H, W], device=grid.device)).abs()
+
     # Split grid into x, y, and z coordinates
-    x, y, z = grid.split(1, dim=-1)
-    
+    z, y, x = grid.split(1, dim=-1)
+
     # Compute interpolation weights
-    x0 = x.floor().cast(dtypes.long)
-    x1 = x0 + 1
-    y0 = y.floor().cast(dtypes.long)
-    y1 = y0 + 1
-    z0 = z.floor().cast(dtypes.long)
+    z0 = z.floor().cast(dtypes.int32)
     z1 = z0 + 1
-    
-    wa = (x1 - x) * (y1 - y) * (z1 - z)
-    wb = (x1 - x) * (y1 - y) * (z - z0)
-    wc = (x1 - x) * (y - y0) * (z1 - z)
-    wd = (x1 - x) * (y - y0) * (z - z0)
-    we = (x - x0) * (y1 - y) * (z1 - z)
-    wf = (x - x0) * (y1 - y) * (z - z0)
-    wg = (x - x0) * (y - y0) * (z1 - z)
-    wh = (x - x0) * (y - y0) * (z - z0)
-    
+    y0 = y.floor().cast(dtypes.int32)
+    y1 = y0 + 1
+    x0 = x.floor().cast(dtypes.int32)
+    x1 = x0 + 1
+
     # Clip indices to volume size
-    x0 = x0.clip(0, W-1)
-    x1 = x1.clip(0, W-1)
-    y0 = y0.clip(0, H-1)
-    y1 = y1.clip(0, H-1)
     z0 = z0.clip(0, D-1)
     z1 = z1.clip(0, D-1)
-    
+    y0 = y0.clip(0, H-1)
+    y1 = y1.clip(0, H-1)
+    x0 = x0.clip(0, W-1)
+    x1 = x1.clip(0, W-1)
+
+    # Compute interpolation weights
+    wa = (z1.float() - z) * (y1.float() - y) * (x1.float() - x)
+    wb = (z1.float() - z) * (y1.float() - y) * (x - x0.float())
+    wc = (z1.float() - z) * (y - y0.float()) * (x1.float() - x)
+    wd = (z1.float() - z) * (y - y0.float()) * (x - x0.float())
+    we = (z - z0.float()) * (y1.float() - y) * (x1.float() - x)
+    wf = (z - z0.float()) * (y1.float() - y) * (x - x0.float())
+    wg = (z - z0.float()) * (y - y0.float()) * (x1.float() - x)
+    wh = (z - z0.float()) * (y - y0.float()) * (x - x0.float())
+
     # Gather voxel values from input tensor
-    Ia = input[:, :, z0, y0, x0]
-    Ib = input[:, :, z0, y0, x1]
-    Ic = input[:, :, z0, y1, x0]
-    Id = input[:, :, z0, y1, x1]
-    Ie = input[:, :, z1, y0, x0]
-    If = input[:, :, z1, y0, x1]
-    Ig = input[:, :, z1, y1, x0]
-    Ih = input[:, :, z1, y1, x1]
-    
+    Ia = input[:, :, z0.squeeze(-1), y0.squeeze(-1), x0.squeeze(-1)]
+    Ib = input[:, :, z0.squeeze(-1), y0.squeeze(-1), x1.squeeze(-1)]
+    Ic = input[:, :, z0.squeeze(-1), y1.squeeze(-1), x0.squeeze(-1)]
+    Id = input[:, :, z0.squeeze(-1), y1.squeeze(-1), x1.squeeze(-1)]
+    Ie = input[:, :, z1.squeeze(-1), y0.squeeze(-1), x0.squeeze(-1)]
+    If = input[:, :, z1.squeeze(-1), y0.squeeze(-1), x1.squeeze(-1)]
+    Ig = input[:, :, z1.squeeze(-1), y1.squeeze(-1), x0.squeeze(-1)]
+    Ih = input[:, :, z1.squeeze(-1), y1.squeeze(-1), x1.squeeze(-1)]
+
     # Perform trilinear interpolation
-    output = (Ia*wa + Ib*wb + Ic*wc + Id*wd + Ie*we + If*wf + Ig*wg + Ih*wh).reshape(N, C, out_D, out_H, out_W)
-    
-    return output
+    output = (Ia*wa + Ib*wb + Ic*wc + Id*wd + Ie*we + If*wf + Ig*wg + Ih*wh)
+
+    # Reshape the output to match the expected shape
+    N, C, D, H, W = input.shape
+    _, out_D, out_H, out_W, _ = grid.shape
+    return output.reshape(N, C, out_D, out_H, out_W)
+
 
 
 
@@ -133,10 +138,11 @@ class tinyNGP:
     def positional_encoding(self, x: Tensor):
         out = [x]
         for j in range(self.L):
-            out.append(Tensor(device=x.device).sin(2**j * x))
-            out.append(Tensor(device=x.device).cos(2**j * x))
-        return Tensor(device=x.device).cat(out, axis=1)
-    
+            out.append((2**j * x).sin())
+            out.append((2**j * x).cos())
+        print(out)
+        return Tensor.cat(*out, dim=1)
+
     def __call__(self, x: Tensor, d):
         
         x /= self.aabb_scale
@@ -175,20 +181,21 @@ class tinyNGP:
             looked_up = self.lookup_tables[str(i)][H_x].transpose(-1, -2)
             volume = looked_up.reshape((looked_up.shape[0], 2, 2, 2, 2))
             # Debugging print statements to verify shapes
-            print(f"volume shape: {volume.shape}")
-            print(f"grid shape: {((x[mask] * N - floor) - 0.5).unsqueeze(1).unsqueeze(1).unsqueeze(1).shape}")
-            #print(f"grid_sample_5d output shape: {grid_sample_5d(volume, ((x[mask] * N - floor) - 0.5).unsqueeze(1).unsqueeze(1).unsqueeze(1)).squeeze(-1).reshape(1, self.F).shape}")
-            print(f"features shape: {features.shape}")
+            # print(f"volume shape: {volume.shape}")
+            # print(f"grid shape: {((x[mask] * N - floor) - 0.5).unsqueeze(1).unsqueeze(1).unsqueeze(1).shape}")
+            # #print(f"grid_sample_5d output shape: {grid_sample_5d(volume, ((x[mask] * N - floor) - 0.5).unsqueeze(1).unsqueeze(1).unsqueeze(1)).squeeze(-1).reshape(1, self.F).shape}")
+            # print(f"features shape: {features.shape}")
 
-            features[:, i * self.F:(i + 1) * self.F] = grid_sample_5d(
-                volume,
-                ((x[mask] * N - floor) - 0.5).unsqueeze(1).unsqueeze(1).unsqueeze(1)
-            ).squeeze(-1).squeeze(-1).squeeze(-1)
+            features[:, i*2:(i+1)*2] = Tensor(torch.nn.functional.grid_sample(
+                torch.tensor(volume.numpy(), dtype=torch.float32),
+                torch.tensor(((x[mask] * N - floor) - 0.5).numpy(), dtype=torch.float32).unsqueeze(1).unsqueeze(1).unsqueeze(1)
+                ).squeeze(-1).squeeze(-1).squeeze(-1).numpy())# this is still bad, but it's a start
+
                         
         xi = self.positional_encoding(d[mask])
         h = features.sequential(self.density_MLP)
         log_sigma[mask] = h[:, 0]
-        color[mask] = Tensor.cat((xi, h[:, 1:]), dim=1).sequential(self.color_MLP)
+        color[mask] = Tensor.cat(xi, h[:, 1:], dim=1).sequential(self.color_MLP)
         return color, Tensor.exp(log_sigma)
 
 class TinyDataLoader:
