@@ -121,7 +121,7 @@ class tinyNGP:
         
         self.density_MLP: List =[
             nn.Linear(self.F * len(Nl), 64),
-            Relu(device=self.device), # not sure how to contextualize device here
+            Relu(device=self.device).apply, # not sure how to contextualize device here
             nn.Linear(64, self.density_MLP_units_out)
         ]
         
@@ -129,9 +129,9 @@ class tinyNGP:
             nn.Linear(self.dir3d_uncode + self.density_MLP_units_out, 64),
             Relu(device=self.device),
             nn.Linear(64, 64),
-            Relu(device=self.device),
+            Relu(device=self.device).apply,
             nn.Linear(64, 3),
-            Sigmoid(device=self.device) 
+            Sigmoid(device=self.device).apply 
         ]
 
         
@@ -152,7 +152,7 @@ class tinyNGP:
         x += 0.5 # x in [0, 1]^3
         
         color = Tensor.zeros((x.shape[0], 3), device=x.device)
-        log_sigma = Tensor.zeros((x.shape[0]), device=x.device) - 1e5 # when we compute sigma it will be 0 (?)
+        log_sigma = (Tensor.zeros((x.shape[0]), device=x.device) - 1e5).contiguous() # when we compute sigma it will be 0 (?)
         features = Tensor.empty((x[mask].shape[0], self.F * len(self.Nl)), device=x.device)
              
         for i, N in enumerate(self.Nl):
