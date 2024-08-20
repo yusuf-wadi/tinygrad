@@ -54,7 +54,5 @@ weights
 *.lprof
 comgr_*
 *.pkl
-*.npz
 site/
 master_schedule.py
-*.png

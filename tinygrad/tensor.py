@@ -2578,18 +2578,6 @@ class Tensor:
     numerator, denominator = self._broadcasted(x, reverse)
     if upcast: numerator, denominator = numerator.cast(least_upper_float(numerator.dtype)), denominator.cast(least_upper_float(denominator.dtype))
     return F.Div.apply(numerator, denominator)
-  
-  def remainder(self, other: int) -> Tensor:
-    """
-    Computes the entry-wise remainder of division.
-    Equivalent to `self % x`.
-    Supports broadcasting to a common shape, type promotion, and integer, boolean inputs.
-
-    ```python exec="true" source="above" session="tensor" result="python"
-    print(Tensor([10, 20, 30]).remainder(7).numpy())
-    ```
-    """
-    return F.Remainder.apply(self, other)
 
   def xor(self, x:Union[Tensor, ConstType], reverse=False) -> Tensor:
     """
@@ -2759,7 +2747,6 @@ class Tensor:
   def __mul__(self, x) -> Tensor: return self.mul(x)
   def __pow__(self, x) -> Tensor: return self.pow(x)
   def __truediv__(self, x) -> Tensor: return self.div(x)
-  def __mod__(self, x) -> Tensor: return self.remainder(x)
   def __matmul__(self, x) -> Tensor: return self.matmul(x)
   def __and__(self, x) -> Tensor: return self.bitwise_and(x)
   def __or__(self, x) -> Tensor: return self.bitwise_or(x)
