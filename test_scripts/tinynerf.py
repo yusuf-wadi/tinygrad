@@ -1,7 +1,6 @@
 from tinygrad import Device
 print(Device.DEFAULT)
 import torch #TODO replace torch where you can
-from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm
 import tinygrad.nn as nn
@@ -10,6 +9,9 @@ from tinygrad.function import Relu, Sigmoid
 from tinygrad import TinyJit
 from PIL import Image
 from typing import List, Dict, Optional
+import os
+import requests
+import matplotlib.pyplot as plt
 
 class tinyNGP:
     
@@ -114,8 +116,26 @@ class tinyNGP:
 
 class TinyNerf:
     """
-    a 'very' tiny nerf model. implementation of a tiny neural radiance field (now tinier in tinygrad!): https://arxiv.org/abs/2003.08934
+    a very tiny nerf model. implementation of a tiny neural radiance field (now tinier in tinygrad!): https://arxiv.org/abs/2003.08934
     """
+    def __init__(self, filter_size=128, num_encoding_functions=6):
+        super().__init__() # https://stackoverflow.com/questions/576169/understanding-python-super-and-init-methods
+        # Input layer (default: 39 -> 128)
+        self.layer1 = nn.Linear(3 + 3 * 2 * num_encoding_functions, filter_size)
+        # Layer 2 (default: 128 -> 128)
+        self.layer2 = nn.Linear(filter_size, filter_size)
+        # Layer 3 (default: 128 -> 4)
+        self.layer3 = nn.Linear(filter_size, 4)
+        # Short hand for torch.nn.functional.relu
+        self.relu = Relu.apply
+        
+    def __call__(self, x):
+        x = self.relu(self.layer1(x))
+        x = self.relu(self.layer2(x))
+        x = self.layer3(x)
+        return x
+        
+    
      
 ## tiny nerf utilitites ##
 def meshgrid(x, y):
@@ -130,9 +150,8 @@ def meshgrid(x, y):
   grid_y = Tensor.cat(*[y.unsqueeze(0)]*x.shape[0])
   return grid_x.reshape(-1, 1), grid_y.reshape(-1, 1)
 
-def roll(tensor, shifts, dims=None):
+def roll(tensor: Tensor, shifts, dims=None):
     if dims is None:
-        # Flatten the tensor if no dimensions are specified
         original_shape = tensor.shape
         tensor = tensor.flatten()
         dims = (0,)
@@ -150,17 +169,23 @@ def roll(tensor, shifts, dims=None):
         shift = shift % rolled_tensor.shape[dim]  # Effective shift
         if shift == 0:
             continue
-        # Perform the roll using slicing
-        rolled_tensor = Tensor.cat((rolled_tensor.slice(dim, shift, None), rolled_tensor.slice(dim, 0, shift)), dim=dim)
+        
+        # Perform the roll using pad and shrink
+        pad_width = [(0, 0)] * rolled_tensor.ndim
+        pad_width[dim] = (0, shift)
+        padded = rolled_tensor.pad(pad_width)
+        
+        shrink_indices = [(0, s) for s in rolled_tensor.shape]
+        shrink_indices[dim] = (shift, shift + rolled_tensor.shape[dim])
+        rolled_tensor = padded.shrink(shrink_indices)
     
     if len(dims) == 1 and dims[0] == 0:
-        # Reshape back to original shape if flattened
         rolled_tensor = rolled_tensor.reshape(original_shape)
     
     return rolled_tensor
 
 def cumprod_exclusive(tensor: Tensor) -> Tensor:
-  r"""Mimick functionality of tf.math.cumprod(..., exclusive=True), as it isn't available in PyTorch.
+  r"""Mimick functionality of tf.math.cumprod(..., exclusive=True), as it isn't available in tinygrad.
 
   Args:
     tensor (Tensor): Tensor whose cumprod (cumulative product, see `torch.cumprod`) along dim=-1
@@ -174,13 +199,13 @@ def cumprod_exclusive(tensor: Tensor) -> Tensor:
   # Only works for the last dimension (dim=-1)
   dim = -1
   # Compute regular cumprod first (this is equivalent to `tf.math.cumprod(..., exclusive=False)`).
-  cumprod = cumprod(tensor, dim)
+  cprod = Tensor(np.cumprod(tensor.numpy(), dim))
   # "Roll" the elements along dimension 'dim' by 1 element.
-  cumprod = roll(cumprod, 1, dim)
+  cprod = roll(cprod, 1, dim).contiguous()
   # Replace the first element by "1" as this is what tf.cumprod(..., exclusive=True) does.
-  cumprod[..., 0] = 1.
+  cprod[..., 0] = 1.
   
-  return cumprod
+  return cprod
 
 def get_ray_bundle(height: int, width: int, focal_length: float, tform_cam2world: Tensor):
   r"""Compute the bundle of rays passing through all pixels of an image (one ray per pixel).
@@ -203,15 +228,15 @@ def get_ray_bundle(height: int, width: int, focal_length: float, tform_cam2world
       (TODO: double check if explanation of row and col indices convention is right).
   """
   # TESTED
-  ii, jj = meshgrid_xy(
-      torch.arange(width).to(tform_cam2world),
-      torch.arange(height).to(tform_cam2world)
+  ii, jj = meshgrid(
+      Tensor.arange(width),
+      Tensor.arange(height)
   )
-  directions = torch.stack([(ii - width * .5) / focal_length,
+  directions = Tensor.stack((ii - width * .5) / focal_length,
                             -(jj - height * .5) / focal_length,
-                            -torch.ones_like(ii)
-                           ], dim=-1)
-  ray_directions = torch.sum(directions[..., None, :] * tform_cam2world[:3, :3], dim=-1)
+                            -Tensor.ones_like(ii)
+                           , dim=-1)
+  ray_directions = Tensor.sum(directions[..., None, :] * tform_cam2world[:3, :3], axis=-1)
   ray_origins = tform_cam2world[:3, -1].expand(ray_directions.shape)
   return ray_origins, ray_directions
 
@@ -249,14 +274,14 @@ def compute_query_points_from_rays(
   """
   # TESTED
   # shape: (num_samples)
-  depth_values = torch.linspace(near_thresh, far_thresh, num_samples).to(ray_origins)
+  depth_values = Tensor(np.linspace(near_thresh, far_thresh, num_samples)).to(ray_origins.device)
   if randomize is True:
     # ray_origins: (width, height, 3)
     # noise_shape = (width, height, num_samples)
     noise_shape = list(ray_origins.shape[:-1]) + [num_samples]
     # depth_values: (num_samples)
     depth_values = depth_values \
-        + torch.rand(noise_shape).to(ray_origins) * (far_thresh
+        + Tensor.rand(noise_shape).to(ray_origins.device) * (far_thresh
             - near_thresh) / num_samples
   # (width, height, num_samples, 3) = (width, height, 1, 3) + (width, height, 1, 3) * (num_samples, 1)
   # query_points:  (width, height, num_samples, 3)
@@ -264,6 +289,99 @@ def compute_query_points_from_rays(
   # TODO: Double-check that `depth_values` returned is of shape `(num_samples)`.
   return query_points, depth_values
 
+def render_volume_density(
+    radiance_field: Tensor,
+    ray_origins: Tensor,
+    depth_values: Tensor
+) -> tuple[Tensor, Tensor, Tensor]:
+  r"""Differentiably renders a radiance field, given the origin of each ray in the
+  "bundle", and the sampled depth values along them.
+
+  Args:
+    radiance_field (Tensor): A "field" where, at each query location (X, Y, Z),
+      we have an emitted (RGB) color and a volume density (denoted :math:`\sigma` in
+      the paper) (shape: :math:`(width, height, num_samples, 4)`).
+    ray_origins (Tensor): Origin of each ray in the "bundle" as returned by the
+      `get_ray_bundle()` method (shape: :math:`(width, height, 3)`).
+    depth_values (Tensor): Sampled depth values along each ray
+      (shape: :math:`(num_samples)`).
+  
+  Returns:
+    rgb_map (Tensor): Rendered RGB image (shape: :math:`(width, height, 3)`).
+    depth_map (Tensor): Rendered depth image (shape: :math:`(width, height)`).
+    acc_map (Tensor): # TODO: Double-check (I think this is the accumulated
+      transmittance map).
+  """
+  # TESTED
+  sigma_a = Relu.apply(radiance_field[..., 3])
+  rgb = Sigmoid.apply(radiance_field[..., :3])
+  one_e_10 = Tensor([1e10], dtype=ray_origins.dtype, device=ray_origins.device)
+  dists = Tensor.cat(depth_values[..., 1:] - depth_values[..., :-1],
+                  one_e_10.expand(depth_values[..., :1].shape), dim=-1)
+  alpha = 1. - Tensor.exp(-sigma_a * dists)
+  weights = alpha * cumprod_exclusive(1. - alpha + 1e-10)
+
+  rgb_map = (weights[..., None] * rgb).sum(axis=-2)
+  depth_map = (weights * depth_values).sum(axis=-1)
+  acc_map = weights.sum(-1)
+
+  return rgb_map, depth_map, acc_map
+
+def positional_encoding(
+    tensor, num_encoding_functions=6, include_input=True, log_sampling=True
+) -> Tensor:
+  r"""Apply positional encoding to the input.
+
+  Args:
+    tensor (Tensor): Input tensor to be positionally encoded.
+    num_encoding_functions (optional, int): Number of encoding functions used to
+        compute a positional encoding (default: 6).
+    include_input (optional, bool): Whether or not to include the input in the
+        computed positional encoding (default: True).
+    log_sampling (optional, bool): Sample logarithmically in frequency space, as
+        opposed to linearly (default: True).
+  
+  Returns:
+    (Tensor): Positional encoding of the input tensor.
+  """
+  # TESTED
+  # Trivially, the input tensor is added to the positional encoding.
+  encoding = [tensor] if include_input else []
+  # Now, encode the input using a set of high-frequency functions and append the
+  # resulting values to the encoding.
+  frequency_bands = None
+  if log_sampling:
+      frequency_bands = Tensor(2.0 ** np.linspace(
+            0.0,
+            num_encoding_functions - 1,
+            num_encoding_functions,
+            #dtype=tensor.dtype,
+        )).to(tensor.device)
+  else:
+      frequency_bands = Tensor(np.linspace(
+          2.0 ** 0.0,
+          2.0 ** (num_encoding_functions - 1),
+          num_encoding_functions,
+          #dtype=tensor.dtype,
+      )).to(tensor.device)
+
+  for freq in frequency_bands:
+      for func in [Tensor.sin, Tensor.cos]:
+          encoding.append(func(tensor * freq))
+
+  # Special case, for no positional encoding
+  if len(encoding) == 1:
+      return encoding[0]
+  else:
+      return Tensor.cat(*encoding, dim=-1)
+  
+
+def get_minibatches(inputs: torch.Tensor, chunksize: Optional[int] = 1024 * 8):
+  r"""Takes a huge tensor (ray "bundle") and splits it into a list of minibatches.
+  Each element of the list (except possibly the last) has dimension `0` of length
+  `chunksize`.
+  """
+  return [inputs[i:i + chunksize] for i in range(0, inputs.shape[0], chunksize)]
 
 class TinyDataLoader:
     def __init__(self, dataset, batch_size, shuffle=True):
@@ -291,7 +409,7 @@ class TinyDataLoader:
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
 
 
-def test(hn, hf, dataset, img_index, chunk_size=20, nb_bins=192, H=400, W=400):
+def test(model, hn, hf, dataset, img_index, chunk_size=20, nb_bins=192, H=400, W=400):
     ray_origins = dataset[img_index * H * W: (img_index + 1) * H * W, :3]
     ray_directions = dataset[img_index * H * W: (img_index + 1) * H * W, 3:6]
 
@@ -306,7 +424,7 @@ def test(hn, hf, dataset, img_index, chunk_size=20, nb_bins=192, H=400, W=400):
     img = Image.fromarray(img)
     img.save(f'novel_views/img_{img_index}.png')
     
-def _test_deb(hn, hf, dataset, img_index, chunk_size=20, nb_bins=192, H=25, W=40):
+def _test_deb(model, hn, hf, dataset, img_index, chunk_size=20, nb_bins=192, H=25, W=40):
     ray_origins = dataset[img_index * H * W: (img_index + 1) * H * W, :3]
     ray_directions = dataset[img_index * H * W: (img_index + 1) * H * W, 3:6]
     
@@ -415,43 +533,12 @@ def grid_sample_5d(input: Tensor, grid: Tensor, mode='bilinear', padding_mode='z
     _, out_D, out_H, out_W, _ = grid.shape
     return output.reshape(N, C, out_D, out_H, out_W)
 
-def cumprod(input, dim, dtype=None):
-    # Ensure input is a tinygrad Tensor
-    if not isinstance(input, Tensor):
-        input = Tensor(input)
-    
-    # Get the shape of the input tensor
-    shape = input.shape
-    
-    # Reshape the tensor to bring the dimension to be cumulated over to the end
-    permutation = list(range(len(shape)))
-    permutation.remove(dim)
-    permutation.append(dim)
-    
-    # Transpose the input tensor according to the permutation
-    reshaped_input = input.permute(*permutation)  # Use * to unpack the list
-    
-    # Compute the cumulative product along the last dimension
-    reshaped_output = Tensor(reshaped_input.numpy().cumprod(axis=-1))
-    
-    # Transpose the output tensor back to the original shape
-    inverse_permutation = list(range(len(shape)))
-    inverse_permutation.insert(dim, inverse_permutation.pop())  # Move last to original dim
-    output = reshaped_output.permute(*inverse_permutation)  # Use * to unpack the list
-    
-    # Cast the output to the specified data type if provided
-    if dtype is not None:
-        output = output.cast(dtype)
-    
-    return output
-
-
 def compute_accumulated_transmittance(alphas):
-    accumulated_transmittance = cumprod(alphas, dim=1)
+    accumulated_transmittance = Tensor(np.cumprod(alphas, dim=1))
     return Tensor.cat(Tensor.ones((accumulated_transmittance.shape[0], 1), device=alphas.device),
                       accumulated_transmittance[:, :-1], dim=-1)
 
-def render_rays(nerf_model, ray_origins, ray_directions, train=False, gt=None, optim=None, hn=0, hf=0.5, nb_bins=192)-> Tensor:
+def render_rays(nerf_model, ray_origins, ray_directions, train=False, gt: Tensor=None, optim: nn.optim.LAMB=None, hn=0, hf=0.5, nb_bins=192)-> Tensor:
     device = ray_origins.device
     t = Tensor(np.linspace(hn, hf, nb_bins)).expand(ray_origins.shape[0], nb_bins)
     # Perturb sampling along each ray.
@@ -484,20 +571,21 @@ def render_rays(nerf_model, ray_origins, ray_directions, train=False, gt=None, o
     
     return pred_px_values
 
+def render_rays_jit(nerf_model, ray_origins, ray_directions, train=False, gt: Tensor=None, optim: nn.optim.LAMB=None, hn=0, hf=0.5, nb_bins=192) -> Tensor:
+    return render_rays(nerf_model, ray_origins, ray_directions, train, gt, optim, hn, hf, nb_bins)
+
+@TinyJit
+@Tensor.train()
 def train(nerf_model: tinyNGP, optimizer: nn.optim.LAMB, data_loader: TinyDataLoader, device='cpu', hn=0, hf=1, nb_epochs=10, nb_bins=192, H=400, W=400):
-    Tensor.training = True
+
     for _ in range(nb_epochs):
         for batch in tqdm(data_loader):
             ray_origins = batch[:, :3].to(device)
             ray_directions = batch[:, 3:6].to(device)
             gt_px_values = batch[:, 6:].to(device)
-            def render_rays_jit():
-                return render_rays(nerf_model, ray_origins, ray_directions,train=True, gt=gt_px_values, optim=optimizer, hn=hn, hf=hf, nb_bins=nb_bins)
-            render_rays_jit = TinyJit(render_rays_jit)
-            loss, optimizer = render_rays_jit()
+            loss, optimizer = render_rays_jit(nerf_model, ray_origins, ray_directions, train=True, gt=gt_px_values, optim=optimizer, hn=hn, hf=hf, nb_bins=nb_bins)
             print(f"Loss: {loss.item()}")
 
-    Tensor.training = False
 
 def load_npz_images(file_path):
     with np.load(file_path) as data:
@@ -507,8 +595,7 @@ def load_npz_images(file_path):
 def load_random_data(H, W, n_images):
     return np.random.rand(H * W * n_images, 9)
 
-if __name__ == "__main__":
-    device = 'cuda:0'
+def _ngp(device):
     H, W = 100,100  # 25 * 40 = 1000
     n_rand_images = 5
     ttr = 0.8
@@ -568,3 +655,187 @@ if __name__ == "__main__":
         test(2, 6, testing_dataset, img_index, nb_bins=192, H=H, W=W)
     # unload the testing data
     del testing_dataset
+    
+# One iteration of TinyNeRF (forward pass).
+def iter_tinynerf(model,chunksize, height, width, focal_length, tform_cam2world,
+                            near_thresh, far_thresh, depth_samples_per_ray,
+                            encoding_function, get_minibatches_function):
+
+    # Get the "bundle" of rays through all image pixels.
+    ray_origins, ray_directions = get_ray_bundle(height, width, focal_length,
+                                                tform_cam2world)
+    
+    # Sample query points along each ray
+    query_points, depth_values = compute_query_points_from_rays(
+        ray_origins, ray_directions, near_thresh, far_thresh, depth_samples_per_ray
+    )
+
+    # "Flatten" the query points.
+    flattened_query_points = query_points.reshape((-1, 3))
+
+    # Encode the query points (default: positional encoding).
+    encoded_points = encoding_function(flattened_query_points)
+
+    # Split the encoded points into "chunks", run the model on all chunks, and
+    # concatenate the results (to avoid out-of-memory issues).
+    batches = get_minibatches_function(encoded_points, chunksize=chunksize)
+    predictions = []
+    for batch in batches:
+        predictions.append(model(batch))
+    radiance_field_flattened = Tensor.cat(*predictions, dim=0)
+
+    # "Unflatten" to obtain the radiance field.
+    unflattened_shape = list(query_points.shape[:-1]) + [4]
+    radiance_field = Tensor.reshape(radiance_field_flattened, unflattened_shape)
+
+    # Perform differentiable volume rendering to re-synthesize the RGB image.
+    rgb_predicted, _, _ = render_volume_density(radiance_field, ray_origins, depth_values)
+    # After obtaining rgb_predicted in iter_tinynerf
+    rgb_predicted = rgb_predicted.reshape(height, width, 3)
+    return rgb_predicted
+    
+def _tinynerf(device):
+    # Download sample data used in the official tiny_nerf example
+    dpath = 'data/tiny_nerf_data.npz'
+    if not os.path.exists(dpath):
+        #!wget http://cseweb.ucsd.edu/~viscomp/projects/LF/papers/ECCV20/nerf/tiny_nerf_data.npz
+        print("Downloading tiny_nerf_data.npz...")
+        url = "http://cseweb.ucsd.edu/~viscomp/projects/LF/papers/ECCV20/nerf/tiny_nerf_data.npz"
+        r = requests.get(url)
+        with open(dpath, 'wb') as f:
+            f.write(r.content)
+
+    # Load input images, poses, and intrinsics
+    data = np.load(dpath)
+    # torch.from_numpy(...).to(device) should be Tensor(...).to(device)
+    # Images
+    images = data["images"]
+    # Camera extrinsics (poses)
+    tform_cam2world = data["poses"]
+    tform_cam2world = Tensor(tform_cam2world).to(device)
+    # Focal length (intrinsics)
+    focal_length = data["focal"]
+    focal_length = Tensor(focal_length).to(device)
+
+    # Height and width of each image
+    height, width = images.shape[1:3]
+
+    # Near and far clipping thresholds for depth values.
+    near_thresh = 2.
+    far_thresh = 6.
+
+    # Hold one image out (for test).
+    testimg, testpose = images[101], tform_cam2world[101]
+    testimg = Tensor(testimg).to(device)
+
+    # Map images to device
+    images = Tensor(images).to(device)
+    
+    bool_display = False
+    if bool_display:
+        plt.imshow(testimg.detach().to('cpu').numpy())  
+        plt.show()
+    
+    """
+    Parameters for TinyNeRF training
+    """
+
+    # Number of functions used in the positional encoding (Be sure to update the 
+    # model if this number changes).
+    num_encoding_functions = 6
+    # Specify encoding function.
+    encode = lambda x: positional_encoding(x, num_encoding_functions=num_encoding_functions)
+    # Number of depth samples along each ray.
+    depth_samples_per_ray = 32
+
+    # Chunksize (Note: this isn't batchsize in the conventional sense. This only
+    # specifies the number of rays to be queried in one go. Backprop still happens
+    # only after all rays from the current "bundle" are queried and rendered).
+    chunksize = 16384  # Use chunksize of about 4096 to fit in ~1.4 GB of GPU memory.
+
+    # Optimizer parameters
+    lr = 5e-4
+    num_iters = 1000
+
+    # Misc parameters
+    display_every = 50  # Number of iters after which stats are displayed
+
+    """
+    Model
+    """
+    model = TinyNerf(num_encoding_functions=num_encoding_functions)
+
+    """
+    Optimizer
+    """
+    optimizer = nn.optim.Adam(nn.state.get_parameters(model), lr=lr)
+
+    """
+    Train-Eval-Repeat!
+    """
+
+    # Seed RNG, for repeatability
+    seed = 9458
+    Tensor.manual_seed(seed)
+    np.random.seed(seed)
+
+    # Lists to log metrics etc.
+    psnrs = []
+    iternums = []
+    
+    @TinyJit
+    @Tensor.train()
+    def step():
+        # Randomly pick an image as the target.
+        target_img_idx = np.random.randint(images.shape[0])
+        target_img = images[target_img_idx].to(device)
+        target_tform_cam2world = tform_cam2world[target_img_idx].to(device)
+
+        # Run one iteration of TinyNeRF and get the rendered RGB image.
+        rgb_predicted = iter_tinynerf(model, chunksize, height, width, focal_length,
+                                                target_tform_cam2world, near_thresh,
+                                                far_thresh, depth_samples_per_ray,
+                                                encode, get_minibatches)
+
+        # Compute mean-squared error between the predicted and target images. Backprop!
+        #print(rgb_predicted.shape, target_img.shape)
+        loss = ((rgb_predicted - target_img) ** 2).mean().backward()
+        optimizer.step()
+        return loss, target_img
+    
+    @Tensor.test()
+    def get_test(target_img):
+        # catching silent breaks
+        # Render the held-out view
+        rgb_predicted = iter_tinynerf(model, chunksize, height, width, focal_length,
+                                    testpose, near_thresh, far_thresh,
+                                    depth_samples_per_ray, encode, get_minibatches)
+        # Compute PSNR
+        loss = ((rgb_predicted - testimg) ** 2).mean()
+        psnr = -10. * np.log10(loss.item())
+        
+        psnrs.append(psnr.item())
+        iternums.append(i)
+        # save image
+        img = (rgb_predicted.detach().clip(0, 1)*255.).cast(dtypes.uint8).to('cpu').numpy()
+        img = Image.fromarray(img)
+        return loss, psnr, img
+        
+    for i in range(num_iters):
+        # Run one iteration of TinyNeRF and backpropagate.
+        loss, target_img = step()
+        optimizer.zero_grad()
+        # Display images/plots/stats
+        if i % display_every == 0:
+            loss_t, psnr_t, img_t = get_test(target_img)
+            print(f"Iteration: {i}, PSNR: {psnr_t.item()}, Loss: {loss_t.item()}")
+            img_t.save(f'images_from_training/img_{i}.png')
+            
+            
+
+    print('Done!')
+        
+if __name__ == "__main__":
+    device = 'cuda:0'
+    _tinynerf(device)
+    #_ngp(device)
